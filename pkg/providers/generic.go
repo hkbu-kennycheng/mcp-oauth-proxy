@@ -13,6 +13,33 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const defaultUserAgent = "mcp-oauth-proxy/1.0"
+
+// userAgentTransport injects User-Agent and Accept headers into outgoing HTTP requests
+type userAgentTransport struct {
+	base      http.RoundTripper
+	userAgent string
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	reqCopy := req.Clone(req.Context())
+	if reqCopy.Header.Get("User-Agent") == "" {
+		ua := t.userAgent
+		if ua == "" {
+			ua = defaultUserAgent
+		}
+		reqCopy.Header.Set("User-Agent", ua)
+	}
+	if reqCopy.Header.Get("Accept") == "" {
+		reqCopy.Header.Set("Accept", "application/json")
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(reqCopy)
+}
+
 // GenericProvider implements a generic OAuth provider
 type GenericProvider struct {
 	authorizeURL string
@@ -25,9 +52,31 @@ func NewGenericProvider(authorizeURL string) *GenericProvider {
 	return &GenericProvider{
 		authorizeURL: authorizeURL,
 		httpClient: &http.Client{
+			Transport: &userAgentTransport{
+				base:      http.DefaultTransport,
+				userAgent: defaultUserAgent,
+			},
 			Timeout: 30 * time.Second,
 		},
 	}
+}
+
+func (p *GenericProvider) getHTTPClient() *http.Client {
+	if p.httpClient == nil {
+		p.httpClient = &http.Client{
+			Transport: &userAgentTransport{
+				base:      http.DefaultTransport,
+				userAgent: defaultUserAgent,
+			},
+			Timeout: 30 * time.Second,
+		}
+	} else if p.httpClient.Transport == nil {
+		p.httpClient.Transport = &userAgentTransport{
+			base:      http.DefaultTransport,
+			userAgent: defaultUserAgent,
+		}
+	}
+	return p.httpClient
 }
 
 // discoverEndpoints attempts to discover OAuth endpoints using well-known paths
@@ -58,7 +107,7 @@ func (p *GenericProvider) discoverEndpoints() error {
 			p.metadata = metadata
 
 			// for github, there is no userinfo endpoint, so we need to provide a hardcoded one
-			if p.metadata.UserinfoEndpoint == "" && parsedURL.Host == "github.com" {
+			if p.metadata.UserinfoEndpoint == "" && (parsedURL.Host == "github.com" || strings.HasSuffix(parsedURL.Host, ".github.com")) {
 				p.metadata.UserinfoEndpoint = "https://api.github.com/user"
 			}
 			return nil
@@ -76,12 +125,17 @@ func (p *GenericProvider) discoverEndpoints() error {
 		GrantTypesSupported:    []string{"authorization_code", "refresh_token"},
 	}
 
+	if parsedURL.Host == "github.com" || strings.HasSuffix(parsedURL.Host, ".github.com") {
+		p.metadata.TokenEndpoint = "https://github.com/login/oauth/access_token"
+		p.metadata.UserinfoEndpoint = "https://api.github.com/user"
+	}
+
 	return nil
 }
 
 // fetchMetadata fetches OAuth metadata from a URL
 func (p *GenericProvider) fetchMetadata(metadataURL string) (*types.OAuthMetadata, error) {
-	resp, err := p.httpClient.Get(metadataURL)
+	resp, err := p.getHTTPClient().Get(metadataURL)
 	if err != nil {
 		return nil, err
 	}
@@ -129,12 +183,13 @@ func (p *GenericProvider) GetAuthorizationURLWithPKCE(clientID, redirectURI, sco
 	return o.AuthCodeURL(state, opts...)
 }
 
-// any exchanges authorization code for tokens
+// ExchangeCodeForToken exchanges authorization code for tokens
 func (p *GenericProvider) ExchangeCodeForToken(ctx context.Context, code, clientID, clientSecret, redirectURI string) (*oauth2.Token, error) {
 	if err := p.discoverEndpoints(); err != nil {
 		return nil, fmt.Errorf("failed to discover endpoints: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, p.getHTTPClient())
 	return p.buildOAuth2Config(p.metadata.AuthorizationEndpoint, clientID, clientSecret, redirectURI, "").Exchange(ctx, code)
 }
 
@@ -155,7 +210,7 @@ func (p *GenericProvider) GetUserInfo(ctx context.Context, accessToken string) (
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := p.httpClient.Do(req)
+	resp, err := p.getHTTPClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %w", err)
 	}
@@ -205,6 +260,7 @@ func (p *GenericProvider) RefreshToken(ctx context.Context, refreshToken, client
 		return nil, fmt.Errorf("failed to discover endpoints: %w", err)
 	}
 
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, p.getHTTPClient())
 	return p.buildOAuth2Config(p.metadata.AuthorizationEndpoint, clientID, clientSecret, "", "").
 		TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).
 		Token()
@@ -215,15 +271,20 @@ func (p *GenericProvider) buildOAuth2Config(authURL, clientID, clientSecret, red
 	if scope != "" {
 		scopes = strings.Fields(scope)
 	}
+	endpoint := oauth2.Endpoint{
+		AuthURL:  authURL,
+		TokenURL: p.metadata.TokenEndpoint,
+	}
+	if p.metadata != nil && (strings.Contains(p.metadata.TokenEndpoint, "github.com") || strings.Contains(authURL, "github.com")) {
+		endpoint.AuthStyle = oauth2.AuthStyleInParams
+	}
+
 	return &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURL:  redirectURI,
 		Scopes:       scopes,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  authURL,
-			TokenURL: p.metadata.TokenEndpoint,
-		},
+		Endpoint:     endpoint,
 	}
 }
 
@@ -239,6 +300,17 @@ func getBool(m map[string]any, key string) bool {
 
 // Helper functions
 func getString(m map[string]any, key string) string {
-	str, _ := m[key].(string)
-	return str
+	if val, ok := m[key]; ok {
+		switch v := val.(type) {
+		case string:
+			return v
+		case float64:
+			return fmt.Sprintf("%.0f", v)
+		case int:
+			return fmt.Sprintf("%d", v)
+		case int64:
+			return fmt.Sprintf("%d", v)
+		}
+	}
+	return ""
 }
