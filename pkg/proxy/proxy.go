@@ -92,6 +92,26 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
+	// Pre-register default OAuth client if configured
+	if config.OAuthClientID != "" {
+		existingClient, _ := db.GetClient(config.OAuthClientID)
+		if existingClient == nil {
+			defaultClient := &types.ClientInfo{
+				ClientID:                config.OAuthClientID,
+				ClientName:              "Default OAuth Client",
+				RedirectUris:            types.StringSlice{"*"},
+				TokenEndpointAuthMethod: "none",
+				GrantTypes:              types.StringSlice{"authorization_code", "refresh_token"},
+				ResponseTypes:           types.StringSlice{"code"},
+				RegistrationDate:        time.Now().Unix(),
+				CreatedAt:               time.Now(),
+			}
+			if err := db.StoreClient(defaultClient); err != nil {
+				log.Printf("Warning: failed to pre-register default OAuth client: %v", err)
+			}
+		}
+	}
+
 	// Initialize rate limiter
 	rateLimiter := ratelimit.NewRateLimiter(
 		time.Duration(15)*time.Minute,

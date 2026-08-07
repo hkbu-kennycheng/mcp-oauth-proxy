@@ -152,7 +152,7 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 
 		// Check if redirect URI is registered for this client
-		if !slices.Contains(clientInfo.RedirectUris, redirectURI) {
+		if !slices.Contains(clientInfo.RedirectUris, "*") && !slices.Contains(clientInfo.RedirectUris, redirectURI) {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 				Error:            "invalid_grant",
 				ErrorDescription: "Invalid redirect URI",

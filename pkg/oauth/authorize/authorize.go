@@ -97,7 +97,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !slices.Contains(clientInfo.RedirectUris, authReq.RedirectURI) {
+	if !slices.Contains(clientInfo.RedirectUris, "*") && !slices.Contains(clientInfo.RedirectUris, authReq.RedirectURI) {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 			Error:            "invalid_request",
 			ErrorDescription: "Invalid redirect URI",
