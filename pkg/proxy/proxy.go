@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -135,9 +136,23 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		return nil, fmt.Errorf("failed to initialize token manager: %w", err)
 	}
 
-	encryptionKey, err := base64.StdEncoding.DecodeString(config.EncryptionKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode encryption key: %w", err)
+	var encryptionKey []byte
+	if config.EncryptionKey == "" {
+		log.Println("ENCRYPTION_KEY not set, generating a random 32-byte AES key in memory")
+		randomKey := make([]byte, 32)
+		if _, err := rand.Read(randomKey); err != nil {
+			return nil, fmt.Errorf("failed to generate random encryption key: %w", err)
+		}
+		encryptionKey = randomKey
+	} else {
+		var err error
+		encryptionKey, err = base64.StdEncoding.DecodeString(config.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode encryption key: %w", err)
+		}
+		if len(encryptionKey) != 16 && len(encryptionKey) != 24 && len(encryptionKey) != 32 {
+			return nil, fmt.Errorf("invalid encryption key length: got %d bytes, expected 16, 24, or 32 bytes (base64 encoded)", len(encryptionKey))
+		}
 	}
 
 	// Split and trim scopes to handle whitespace

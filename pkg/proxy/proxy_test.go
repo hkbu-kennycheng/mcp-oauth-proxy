@@ -155,6 +155,38 @@ func TestLoadConfigFromEnv(t *testing.T) {
 	})
 }
 
+func TestNewOAuthProxy_EncryptionKeyAutoGeneration(t *testing.T) {
+	t.Run("AutoGeneratesKeyWhenEmpty", func(t *testing.T) {
+		config := &types.Config{
+			Mode:         ModeForwardAuth,
+			EncryptionKey: "", // empty
+		}
+		p, err := NewOAuthProxy(config)
+		require.NoError(t, err)
+		assert.Len(t, p.encryptionKey, 32)
+	})
+
+	t.Run("DecodesValidBase64Key", func(t *testing.T) {
+		config := &types.Config{
+			Mode:          ModeForwardAuth,
+			EncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", // 32 bytes base64
+		}
+		p, err := NewOAuthProxy(config)
+		require.NoError(t, err)
+		assert.Len(t, p.encryptionKey, 32)
+	})
+
+	t.Run("RejectsInvalidKeyLength", func(t *testing.T) {
+		config := &types.Config{
+			Mode:          ModeForwardAuth,
+			EncryptionKey: "YWJj", // "abc" = 3 bytes
+		}
+		_, err := NewOAuthProxy(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid encryption key length")
+	})
+}
+
 func TestSetHeaders(t *testing.T) {
 	t.Run("AllProperties", func(t *testing.T) {
 		header := make(http.Header)
