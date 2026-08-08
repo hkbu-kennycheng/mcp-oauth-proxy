@@ -43,6 +43,7 @@ type OAuthProxy struct {
 	encryptionKey []byte
 	resourceName  string
 	config        *types.Config
+	allowedEmails []string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -157,6 +158,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 
 	// Split and trim scopes to handle whitespace
 	scopesSupported := ParseScopesSupported(config.ScopesSupported)
+	allowedEmails := ParseAllowedEmails(config.AllowedEmails)
 
 	metadata := &types.OAuthMetadata{
 		ResponseTypesSupported:                   []string{"code"},
@@ -178,6 +180,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		resourceName:  "MCP Tools",
 		encryptionKey: encryptionKey,
 		config:        config,
+		allowedEmails: allowedEmails,
 	}, nil
 }
 
@@ -243,7 +246,7 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 
 	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix)
 	tokenHandler := token.NewHandler(p.db)
-	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix)
+	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, p.allowedEmails)
 	revokeHandler := revoke.NewHandler(p.db)
 	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths)
 	successHandler := success.NewHandler()
@@ -596,4 +599,16 @@ func ParseScopesSupported(envScopes string) []string {
 		}
 	}
 	return scopesSupported
+}
+
+// ParseAllowedEmails parses a comma-separated allowed emails string and trims whitespace / lowercases each email.
+func ParseAllowedEmails(envAllowedEmails string) []string {
+	emailsRaw := strings.Split(envAllowedEmails, ",")
+	allowedEmails := make([]string, 0, len(emailsRaw))
+	for _, email := range emailsRaw {
+		if trimmed := strings.TrimSpace(email); trimmed != "" {
+			allowedEmails = append(allowedEmails, strings.ToLower(trimmed))
+		}
+	}
+	return allowedEmails
 }
