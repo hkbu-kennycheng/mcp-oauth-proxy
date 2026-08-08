@@ -34,6 +34,7 @@ type RootCmd struct {
 
 	// Security configuration
 	EncryptionKey string `name:"encryption-key" env:"ENCRYPTION_KEY" usage:"Base64-encoded 32-byte AES-256 key for encrypting sensitive data (optional)"`
+	AllowedEmails string `name:"allowed-emails" env:"ALLOWED_EMAILS" usage:"Comma-separated list of allowed user emails (optional)"`
 
 	// Server configuration
 	Port        string `name:"port" env:"PORT" usage:"Port to run the server on" default:"8080"`
@@ -73,6 +74,7 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		EncryptionKey:     c.EncryptionKey,
 		Mode:              c.Mode,
 		RoutePrefix:       c.RoutePrefix,
+		AllowedEmails:     c.AllowedEmails,
 	}
 
 	// Validate configuration
