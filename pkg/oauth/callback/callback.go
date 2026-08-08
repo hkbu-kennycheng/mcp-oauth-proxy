@@ -31,6 +31,7 @@ type Handler struct {
 	clientSecret     string
 	routePrefix      string
 	cookieNamePrefix string
+	allowedEmails    []string
 }
 
 // MCPUIManager interface for generating JWT tokens
@@ -38,7 +39,7 @@ type MCPUIManager interface {
 	GenerateMCPUICodeForDownstream(bearerToken, refreshToken string) (string, error)
 }
 
-func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string) http.Handler {
+func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, allowedEmails []string) http.Handler {
 	return &Handler{
 		db:               db,
 		provider:         provider,
@@ -47,6 +48,7 @@ func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, cli
 		clientSecret:     clientSecret,
 		routePrefix:      routePrefix,
 		cookieNamePrefix: cookieNamePrefix,
+		allowedEmails:    allowedEmails,
 	}
 }
 
@@ -113,13 +115,13 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Handle OAuth callback from external providers
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
-	error := r.URL.Query().Get("error")
+	errParam := r.URL.Query().Get("error")
 	errorDescription := r.URL.Query().Get("error_description")
 
 	// Check for OAuth errors
-	if error != "" {
+	if errParam != "" {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
-			Error:            error,
+			Error:            errParam,
 			ErrorDescription: errorDescription,
 		})
 		return
@@ -176,9 +178,9 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if scope includes profile or email before getting user info
+	// Check if scope includes profile or email or if email whitelist is enabled before getting user info
 	scopes := strings.Fields(authReq.Scope)
-	needsUserInfo := p.scopeContainsProfileOrEmail(scopes)
+	needsUserInfo := p.scopeContainsProfileOrEmail(scopes) || len(p.allowedEmails) > 0
 
 	userInfo := &providers.UserInfo{}
 	if needsUserInfo {
@@ -189,6 +191,26 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 				Error:            "invalid_grant",
 				ErrorDescription: "Failed to get user information",
+			})
+			return
+		}
+	}
+
+	// Enforce email whitelist if configured
+	if len(p.allowedEmails) > 0 {
+		emailAllowed := false
+		userEmail := strings.ToLower(strings.TrimSpace(userInfo.Email))
+		for _, allowed := range p.allowedEmails {
+			if strings.EqualFold(userEmail, strings.ToLower(strings.TrimSpace(allowed))) {
+				emailAllowed = true
+				break
+			}
+		}
+		if !emailAllowed {
+			log.Printf("Access denied: user email '%s' is not in the allowed emails whitelist", userInfo.Email)
+			handlerutils.JSON(w, http.StatusForbidden, types.OAuthError{
+				Error:            "access_denied",
+				ErrorDescription: "Email not authorized to access this service",
 			})
 			return
 		}
