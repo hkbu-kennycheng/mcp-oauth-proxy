@@ -13,16 +13,23 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/tokens"
 )
 
 // StdioTransport implements Transport for stdio-based upstream MCP servers
 type StdioTransport struct {
-	commands []string       // Command and arguments to execute
-	env      []string       // Additional environment variables
-	cwd      string         // Working directory (optional)
+	commands []string
+	env      []string
+	cwd      string
+
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+
+	mu         sync.Mutex
+	started    bool
+	startError error
 }
 
 // NewStdioTransport creates a new stdio transport
@@ -31,7 +38,6 @@ func NewStdioTransport(command string, env map[string]string, cwd string) (*Stdi
 		return nil, errors.New("mcp server command is required for stdio transport")
 	}
 
-	// Parse the command - split on spaces but preserve quoted strings
 	commands, err := parseCommand(command)
 	if err != nil {
 		return nil, fmt.Errorf("invalid mcp server command: %w", err)
@@ -41,7 +47,6 @@ func NewStdioTransport(command string, env map[string]string, cwd string) (*Stdi
 		return nil, errors.New("mcp server command is empty")
 	}
 
-	// Convert env map to []string
 	var envList []string
 	if env != nil {
 		for k, v := range env {
@@ -56,28 +61,69 @@ func NewStdioTransport(command string, env map[string]string, cwd string) (*Stdi
 	}, nil
 }
 
-// parseCommand splits a command string while respecting quotes
-func parseCommand(command string) ([]string, error) {
-	// Use shell-like parsing
-	parts := strings.Fields(command)
-	if len(parts) == 0 {
-		return nil, errors.New("empty command")
+// Start launches the MCP server subprocess
+func (t *StdioTransport) Start() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.started {
+		return t.startError
 	}
-	return parts, nil
+
+	cmd := exec.Command(t.commands[0], t.commands[1:]...)
+
+	if t.env != nil {
+		cmd.Env = append(cmd.Env, t.env...)
+	}
+
+	if t.cwd != "" {
+		cmd.Dir = t.cwd
+	}
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		t.started = true
+		t.startError = fmt.Errorf("failed to create stdin pipe: %w", err)
+		return t.startError
+	}
+	t.stdin = stdinPipe
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.started = true
+		t.startError = fmt.Errorf("failed to create stdout pipe: %w", err)
+		return t.startError
+	}
+	t.stdout = stdoutPipe
+
+	if err := cmd.Start(); err != nil {
+		t.started = true
+		t.startError = fmt.Errorf("failed to start MCP server: %w", err)
+		return t.startError
+	}
+
+	t.cmd = cmd
+	t.started = true
+	t.startError = nil
+
+	// Wait for process to exit in a goroutine
+	go func() {
+		cmd.Wait()
+	}()
+
+	return nil
 }
 
 // ServeHTTP handles an HTTP request by forwarding it to the stdio MCP server
 func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, tokenInfo *tokens.TokenInfo) {
-	ctx := r.Context()
-
-	// Spawn a new MCP server subprocess for this request
-	session, err := t.spawnProcess(ctx)
-	if err != nil {
-		log.Printf("Failed to spawn MCP server: %v", err)
+	// Ensure the MCP server is started
+	if err := t.Start(); err != nil {
+		log.Printf("Failed to start MCP server: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to start MCP server: %v", err), http.StatusInternalServerError)
 		return
 	}
-	defer session.Terminate()
+
+	ctx := r.Context()
 
 	// Read the request body
 	body, err := readRequestBody(r)
@@ -96,7 +142,7 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 	log.Printf("Sending %d bytes to MCP server", len(body))
 
 	// Send the message to the MCP server
-	response, err := t.sendMessage(ctx, session, body)
+	response, err := t.sendMessage(ctx, body)
 	if err != nil {
 		log.Printf("Failed to get response from MCP server: %v", err)
 		http.Error(w, fmt.Sprintf("MCP server error: %v", err), http.StatusBadGateway)
@@ -105,129 +151,40 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 
 	log.Printf("Received %d bytes from MCP server", len(response))
 
+	// If this was an initialize request, also send the initialized notification
+	// This is required by the MCP protocol to complete the handshake
+	if isInitializeRequest(body) {
+		initializedMsg := []byte(`{"jsonrpc":"2.0","id":0,"method":"initialized","params":{}}`)
+
+		_, initErr := t.sendMessage(ctx, initializedMsg)
+		if initErr != nil {
+			log.Printf("Warning: failed to send initialized notification: %v", initErr)
+		}
+	}
+
 	// Set content type and write response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(response)
 }
 
-// StdioSession manages a single subprocess session
-type StdioSession struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	ctx    context.Context
-	cancel context.CancelFunc
+// sendMessage sends a message to the MCP server and returns the response
+func (t *StdioTransport) sendMessage(ctx context.Context, message []byte) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	readMu  sync.Mutex
-	writeMu sync.Mutex
-}
-
-// spawnProcess starts a new MCP server subprocess
-func (t *StdioTransport) spawnProcess(ctx context.Context) (*StdioSession, error) {
-	// Create a cancellable context for this subprocess
-	sessionCtx, cancel := context.WithCancel(ctx)
-
-	// Set up the command
-	cmd := exec.CommandContext(sessionCtx, t.commands[0], t.commands[1:]...)
-
-	// Set environment variables
-	if t.env != nil {
-		if cmd.Env == nil {
-			cmd.Env = []string{}
-		}
-		cmd.Env = append(cmd.Env, t.env...)
+	if t.stdin == nil || t.stdout == nil {
+		return nil, errors.New("MCP server not started")
 	}
 
-	// Set working directory if specified
-	if t.cwd != "" {
-		cmd.Dir = t.cwd
-	}
-
-	// Create pipes for stdin and stdout
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	// Capture stderr for logging (discard for now, could be logged)
-	cmd.Stderr = nil
-
-	// Start the subprocess
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to start MCP server: %w", err)
-	}
-
-	session := &StdioSession{
-		cmd:    cmd,
-		stdin:  stdinPipe,
-		stdout: stdoutPipe,
-		ctx:    sessionCtx,
-		cancel: cancel,
-	}
-
-	// Start a goroutine to wait for process exit
-	go func() {
-		<-sessionCtx.Done()
-		// Close stdin to signal the process to exit naturally
-		if session.stdin != nil {
-			session.stdin.Close()
-		}
-		// Wait briefly for the process to exit on its own
-		done := make(chan struct{})
-		go func() {
-			session.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-			// Process exited naturally
-		case <-time.After(3 * time.Second):
-			// Force kill if it doesn't exit within 3 seconds
-			if session.cmd.Process != nil {
-				session.cmd.Process.Kill()
-			}
-			session.cmd.Wait()
-		}
-	}()
-
-	return session, nil
-}
-
-// sendMessage sends a message to the MCP server's stdin and reads the response from stdout
-func (t *StdioTransport) sendMessage(ctx context.Context, session *StdioSession, message []byte) ([]byte, error) {
 	// Write the message to stdin followed by newline
-	session.writeMu.Lock()
-	_, err := session.stdin.Write(append(message, '\n'))
+	_, err := t.stdin.Write(append(message, '\n'))
 	if err != nil {
-		session.writeMu.Unlock()
 		return nil, fmt.Errorf("failed to write to MCP server: %w", err)
 	}
 
-	// Flush the stdin pipe to ensure the message is sent immediately
-	if flusher, ok := session.stdin.(interface{ Flush() error }); ok {
-		flushErr := flusher.Flush()
-		if flushErr != nil {
-			session.writeMu.Unlock()
-			return nil, fmt.Errorf("failed to flush MCP server input: %w", flushErr)
-		}
-	}
-	session.writeMu.Unlock()
-
 	// Set up a reader for stdout
-	reader := bufio.NewReader(session.stdout)
-
-	// Read response from stdout - wait for a single line (JSON message)
-	session.readMu.Lock()
-	defer session.readMu.Unlock()
+	reader := bufio.NewReader(t.stdout)
 
 	// Read one line (one JSON message)
 	response, err := reader.ReadBytes('\n')
@@ -253,14 +210,33 @@ func (t *StdioTransport) sendMessage(ctx context.Context, session *StdioSession,
 	return response, nil
 }
 
-// Terminate closes the stdin pipe to signal end of input to the MCP server.
-// The subprocess will naturally exit after finishing its response.
-func (s *StdioSession) Terminate() {
-	// Close stdin to signal we're done sending input
-	// This allows the MCP server to see EOF and finish its response naturally
-	if s.stdin != nil {
-		s.stdin.Close()
+// Close shuts down the MCP server subprocess
+func (t *StdioTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.stdin != nil {
+		t.stdin.Close()
 	}
+
+	if t.stdout != nil {
+		t.stdout.Close()
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		t.cmd.Process.Kill()
+	}
+
+	return nil
+}
+
+// parseCommand splits a command string into parts
+func parseCommand(command string) ([]string, error) {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return nil, errors.New("empty command")
+	}
+	return parts, nil
 }
 
 // readRequestBody reads the HTTP request body
@@ -327,9 +303,4 @@ func injectUserContext(body []byte, tokenInfo *tokens.TokenInfo) []byte {
 		return body
 	}
 	return modifiedBody
-}
-
-// Close is a no-op for stdio transport (sessions are managed per-request)
-func (t *StdioTransport) Close() error {
-	return nil
 }

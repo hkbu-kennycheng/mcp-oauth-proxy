@@ -149,7 +149,9 @@ func TestStdioTransport_Integration(t *testing.T) {
 		assert.Equal(t, "test-mcp-server", resultMap["serverInfo"].(map[string]interface{})["name"])
 	})
 
-	t.Run("GenericRequest", func(t *testing.T) {
+	t.Run("GenericRequestAfterInitialize", func(t *testing.T) {
+		// This tests that the MCP server stays alive after initialize
+		// and can handle subsequent requests
 		simpleRequest := `{"jsonrpc":"2.0","id":2,"method":"ping"}`
 
 		req := httptest.NewRequest("POST", "/mcp", strings.NewReader(simpleRequest))
