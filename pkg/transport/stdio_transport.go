@@ -26,6 +26,7 @@ type StdioTransport struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	reader *bufio.Reader
 
 	mu         sync.Mutex
 	started    bool
@@ -95,6 +96,7 @@ func (t *StdioTransport) Start() error {
 		return t.startError
 	}
 	t.stdout = stdoutPipe
+	t.reader = bufio.NewReader(stdoutPipe)
 
 	if err := cmd.Start(); err != nil {
 		t.started = true
@@ -168,7 +170,9 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 	w.Write(response)
 }
 
-// sendMessage sends a message to the MCP server and returns the response
+// sendMessage sends a message to the MCP server and returns the response.
+// It skips over any unsolicited notifications (messages without an "id" field)
+// that the server may have sent.
 func (t *StdioTransport) sendMessage(ctx context.Context, message []byte) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -183,31 +187,37 @@ func (t *StdioTransport) sendMessage(ctx context.Context, message []byte) ([]byt
 		return nil, fmt.Errorf("failed to write to MCP server: %w", err)
 	}
 
-	// Set up a reader for stdout
-	reader := bufio.NewReader(t.stdout)
-
-	// Read one line (one JSON message)
-	response, err := reader.ReadBytes('\n')
-	if err != nil {
-		if err.Error() == "EOF" {
-			return nil, fmt.Errorf("MCP server closed connection unexpectedly")
+	// Read responses from the persistent buffered reader until we get one with an "id"
+	// (i.e., a response, not a notification)
+	for {
+		response, err := t.reader.ReadBytes('\n')
+		if err != nil {
+			if err.Error() == "EOF" {
+				return nil, fmt.Errorf("MCP server closed connection unexpectedly")
+			}
+			return nil, fmt.Errorf("failed to read from MCP server: %w", err)
 		}
-		return nil, fmt.Errorf("failed to read from MCP server: %w", err)
+
+		// Trim the trailing newline/carriage return
+		response = bytes.TrimRight(response, "\n\r")
+
+		if len(response) == 0 {
+			continue
+		}
+
+		// Validate that response looks like JSON
+		if response[0] != '{' && response[0] != '[' {
+			return nil, fmt.Errorf("MCP server response is not valid JSON: %s", string(response))
+		}
+
+		// Check if this is a response (has "id" field) or a notification (no "id")
+		// Notifications should be skipped - they are unsolicited server messages
+		if isResponse(response) {
+			return response, nil
+		}
+
+		log.Printf("Discarding unsolicited notification from MCP server: %s", string(response))
 	}
-
-	// Trim the trailing newline/carriage return
-	response = bytes.TrimRight(response, "\n\r")
-
-	if len(response) == 0 {
-		return nil, fmt.Errorf("empty response from MCP server")
-	}
-
-	// Validate that response looks like JSON
-	if len(response) > 0 && response[0] != '{' && response[0] != '[' {
-		return nil, fmt.Errorf("MCP server response is not valid JSON: %s", string(response))
-	}
-
-	return response, nil
 }
 
 // sendNotification sends a notification (message without expecting a response) to the MCP server
@@ -271,6 +281,20 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 	return buf, nil
+}
+
+// isResponse checks if a JSON message is a response (has an "id" field).
+// In JSON-RPC, requests have an "id" but notifications do not.
+// This is used to distinguish between responses we should return and
+// unsolicited notifications that should be discarded.
+func isResponse(data []byte) bool {
+	var msg struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return false
+	}
+	return len(msg.ID) > 0
 }
 
 // isInitializeRequest checks if the request body is an MCP initialize request
