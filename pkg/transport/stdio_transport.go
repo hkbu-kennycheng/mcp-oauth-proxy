@@ -154,9 +154,9 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 	// If this was an initialize request, also send the initialized notification
 	// This is required by the MCP protocol to complete the handshake
 	if isInitializeRequest(body) {
-		initializedMsg := []byte(`{"jsonrpc":"2.0","id":0,"method":"initialized","params":{}}`)
+		initializedMsg := []byte(`{"jsonrpc":"2.0","method":"initialized","params":{}}`)
 
-		_, initErr := t.sendMessage(ctx, initializedMsg)
+		initErr := t.sendNotification(ctx, initializedMsg)
 		if initErr != nil {
 			log.Printf("Warning: failed to send initialized notification: %v", initErr)
 		}
@@ -208,6 +208,23 @@ func (t *StdioTransport) sendMessage(ctx context.Context, message []byte) ([]byt
 	}
 
 	return response, nil
+}
+
+// sendNotification sends a notification (message without expecting a response) to the MCP server
+func (t *StdioTransport) sendNotification(ctx context.Context, message []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.stdin == nil {
+		return errors.New("MCP server not started")
+	}
+
+	_, err := t.stdin.Write(append(message, '\n'))
+	if err != nil {
+		return fmt.Errorf("failed to write notification to MCP server: %w", err)
+	}
+
+	return nil
 }
 
 // Close shuts down the MCP server subprocess
