@@ -30,7 +30,10 @@ type RootCmd struct {
 
 	// Scopes and MCP configuration
 	ScopesSupported string `name:"scopes-supported" env:"SCOPES_SUPPORTED" usage:"Comma-separated list of supported OAuth scopes (e.g., 'openid,profile,email')" required:"true"`
-	MCPServerURL    string `name:"mcp-server-url" env:"MCP_SERVER_URL" usage:"URL of the MCP server to proxy requests to" required:"true"`
+	MCPServerURL    string `name:"mcp-server-url" env:"MCP_SERVER_URL" usage:"URL of the MCP server to proxy requests to (HTTP/HTTPS, mutually exclusive with --mcp-server-command)"`
+	MCPServerCommand string `name:"mcp-server-command" env:"MCP_SERVER_COMMAND" usage:"Command to execute MCP server as a stdio subprocess (e.g., 'python /path/to/mcp-server.py' or 'node /path/to/mcp-server.js'), mutually exclusive with --mcp-server-url"`
+	MCPServerEnv    string `name:"mcp-server-env" env:"MCP_SERVER_ENV" usage:"JSON object of additional environment variables for the MCP server subprocess (e.g., '{\"API_KEY\":\"key123\"}')"`
+	MCPServerCwd    string `name:"mcp-server-cwd" env:"MCP_SERVER_CWD" usage:"Working directory for the MCP server subprocess (optional, defaults to current directory)"`
 
 	// Security configuration
 	EncryptionKey string `name:"encryption-key" env:"ENCRYPTION_KEY" usage:"Base64-encoded 32-byte AES-256 key for encrypting sensitive data (optional)"`
@@ -71,6 +74,9 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		OAuthJWKSURL:      c.OAuthJWKSURL,
 		ScopesSupported:   c.ScopesSupported,
 		MCPServerURL:      c.MCPServerURL,
+		MCPServerCommand:  c.MCPServerCommand,
+		MCPServerEnv:      c.MCPServerEnv,
+		MCPServerCwd:      c.MCPServerCwd,
 		EncryptionKey:     c.EncryptionKey,
 		Mode:              c.Mode,
 		RoutePrefix:       c.RoutePrefix,
@@ -100,7 +106,11 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	address := fmt.Sprintf("%s:%s", c.Host, c.Port)
 	log.Printf("Starting OAuth proxy server on %s", address)
 	log.Printf("OAuth Provider: %s", c.OAuthAuthorizeURL)
-	log.Printf("MCP Server: %s", c.MCPServerURL)
+	if c.MCPServerURL != "" {
+		log.Printf("MCP Server (HTTP): %s", c.MCPServerURL)
+	} else if c.MCPServerCommand != "" {
+		log.Printf("MCP Server (stdio): %s", c.MCPServerCommand)
+	}
 	log.Printf("Database: %s", c.getDatabaseType())
 
 	return http.ListenAndServe(address, handler)
@@ -119,10 +129,26 @@ func (c *RootCmd) validateConfig() error {
 	if c.ScopesSupported == "" {
 		return fmt.Errorf("scopes-supported is required")
 	}
-	if c.MCPServerURL == "" {
-		return fmt.Errorf("mcp-server-url is required")
+
+	// Validate that exactly one MCP server source is configured
+	// MCPServerURL and MCPServerCommand are mutually exclusive
+	if c.MCPServerURL == "" && c.MCPServerCommand == "" {
+		return fmt.Errorf("either mcp-server-url or mcp-server-command is required")
 	}
-	if c.Mode == proxy.ModeProxy {
+	if c.MCPServerURL != "" && c.MCPServerCommand != "" {
+		return fmt.Errorf("mcp-server-url and mcp-server-command are mutually exclusive, specify only one")
+	}
+
+	// For stdio mode, we need a valid mode that supports proxying
+	if c.MCPServerCommand != "" {
+		// Stdio mode requires proxy mode to work
+		if c.Mode != proxy.ModeProxy {
+			return fmt.Errorf("mcp-server-command requires mode to be 'proxy'")
+		}
+	}
+
+	// Validate HTTP URL only for proxy mode with HTTP transport
+	if c.MCPServerURL != "" && c.Mode == proxy.ModeProxy {
 		if u, err := url.Parse(c.MCPServerURL); err != nil || u.Scheme != "http" && u.Scheme != "https" {
 			return fmt.Errorf("invalid MCP server URL: %w", err)
 		} else if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
@@ -152,8 +178,12 @@ OAuth authorization server functionality with PostgreSQL/SQLite storage.
 This proxy supports multiple OAuth providers (Google, Microsoft, GitHub) and
 proxies requests to MCP servers with user context headers.
 
+The proxy supports two modes for communicating with the upstream MCP server:
+1. HTTP transport: Proxy requests to an HTTP/HTTPS MCP server
+2. Stdio transport: Spawn a subprocess MCP server and bridge HTTP to stdio
+
 Examples:
-  # Start with environment variables
+  # Start with HTTP MCP server
   export OAUTH_CLIENT_ID="your-google-client-id"
   export OAUTH_CLIENT_SECRET="your-secret"
   export OAUTH_AUTHORIZE_URL="https://accounts.google.com"
@@ -161,13 +191,31 @@ Examples:
   export MCP_SERVER_URL="http://localhost:3000"
   mcp-oauth-proxy
 
-  # Start with CLI flags
+  # Start with stdio MCP server (subprocess)
+  export OAUTH_CLIENT_ID="your-google-client-id"
+  export OAUTH_CLIENT_SECRET="your-secret"
+  export OAUTH_AUTHORIZE_URL="https://accounts.google.com"
+  export SCOPES_SUPPORTED="openid,profile,email"
+  export MCP_SERVER_COMMAND="python /path/to/mcp-server.py"
+  export MCP_SERVER_ENV='{"API_KEY":"key123"}'
+  mcp-oauth-proxy
+
+  # Start with CLI flags (HTTP transport)
   mcp-oauth-proxy \
     --oauth-client-id="your-google-client-id" \
     --oauth-client-secret="your-secret" \
     --oauth-authorize-url="https://accounts.google.com" \
     --scopes-supported="openid,profile,email" \
     --mcp-server-url="http://localhost:3000"
+
+  # Start with CLI flags (stdio transport)
+  mcp-oauth-proxy \
+    --oauth-client-id="your-google-client-id" \
+    --oauth-client-secret="your-secret" \
+    --oauth-authorize-url="https://accounts.google.com" \
+    --scopes-supported="openid,profile,email" \
+    --mcp-server-command="python /path/to/mcp-server.py" \
+    --mcp-server-env='{"API_KEY":"key123"}'
 
   # Use PostgreSQL database
   mcp-oauth-proxy \
@@ -180,6 +228,8 @@ Configuration:
   1. Default values
   2. Environment variables
   3. Command line flags
+
+  MCP_SERVER_URL and MCP_SERVER_COMMAND are mutually exclusive. Specify one.
 
 Database Support:
   - PostgreSQL: Full ACID compliance, recommended for production

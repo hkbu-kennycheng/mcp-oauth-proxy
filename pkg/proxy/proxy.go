@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"maps"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strconv"
@@ -29,6 +29,7 @@ import (
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/ratelimit"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/tokens"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/transport"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"golang.org/x/oauth2"
 )
@@ -44,6 +45,7 @@ type OAuthProxy struct {
 	resourceName  string
 	config        *types.Config
 	allowedEmails []string
+	transport     transport.Transport
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -80,11 +82,31 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		return nil, fmt.Errorf("invalid mode: %s", config.Mode)
 	}
 
+	// Initialize transport based on configuration
+	var proxyTransport transport.Transport
 	if config.Mode == ModeProxy {
-		if u, err := url.Parse(config.MCPServerURL); err != nil || u.Scheme != "http" && u.Scheme != "https" {
-			return nil, fmt.Errorf("invalid MCP server URL: %w", err)
-		} else if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
-			return nil, fmt.Errorf("MCP server URL must not contain a path, query, or fragment")
+		if config.MCPServerCommand != "" {
+			// Stdio transport mode
+			envMap := parseEnvJSON(config.MCPServerEnv)
+			stdioTransport, err := transport.NewStdioTransport(config.MCPServerCommand, envMap, config.MCPServerCwd)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create stdio transport: %w", err)
+			}
+			proxyTransport = stdioTransport
+		} else if config.MCPServerURL != "" {
+			// HTTP transport mode
+			if u, err := url.Parse(config.MCPServerURL); err != nil || u.Scheme != "http" && u.Scheme != "https" {
+				return nil, fmt.Errorf("invalid MCP server URL: %w", err)
+			} else if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+				return nil, fmt.Errorf("MCP server URL must not contain a path, query, or fragment")
+			}
+			httpTransport, err := transport.NewHTTPTransport(config.MCPServerURL, config.RoutePrefix, config.CookieNamePrefix)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create HTTP transport: %w", err)
+			}
+			proxyTransport = httpTransport
+		} else {
+			return nil, fmt.Errorf("either mcp-server-url or mcp-server-command is required for proxy mode")
 		}
 	}
 
@@ -181,6 +203,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		encryptionKey: encryptionKey,
 		config:        config,
 		allowedEmails: allowedEmails,
+		transport:     proxyTransport,
 	}, nil
 }
 
@@ -371,7 +394,6 @@ func (p *OAuthProxy) protectedResourceMetadataHandler(w http.ResponseWriter, r *
 
 func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, next http.Handler) {
 	tokenInfo := validate.GetTokenInfo(r)
-	path := r.PathValue("path")
 
 	// Check if the access token is expired and refresh if needed
 	if tokenInfo != nil && tokenInfo.Props != nil {
@@ -451,55 +473,15 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 	case ModeForwardAuth:
 		setHeaders(w.Header(), tokenInfo.Props)
 	case ModeProxy:
-		// Create target URL
-		targetURL := p.GetMCPServerURL() + "/" + path
-		// Log the proxy request for debugging
-		log.Printf("Proxying request: %s %s -> %s", r.Method, r.URL.Path, targetURL)
-
-		// Create reverse proxy
-		proxy := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.Header.Del("Authorization")
-				req.Header.Set("X-Forwarded-Host", req.Host)
-				req.Header.Set("X-Forwarded-Proto", req.URL.Scheme)
-
-				newURL, _ := url.Parse(targetURL)
-				req.URL.Scheme = newURL.Scheme
-				req.URL.Host = newURL.Host
-				req.Host = newURL.Host
-
-				// Add forwarded headers from token props
-				setHeaders(req.Header, tokenInfo.Props)
-			},
-			ModifyResponse: func(resp *http.Response) error {
-				// Rewrite Location header to use proxy host instead of downstream server host
-				if location := resp.Header.Get("Location"); location != "" {
-					if locationURL, err := url.Parse(location); err == nil {
-						// Get the original request to extract proxy host
-						proxyHost := resp.Request.Header.Get("X-Forwarded-Host")
-						if proxyHost != "" {
-							// Parse downstream server URL to get scheme
-							downstreamURL, _ := url.Parse(p.GetMCPServerURL())
-
-							// Only rewrite if the location points to the downstream server
-							if locationURL.Host == downstreamURL.Host {
-								locationURL.Scheme = resp.Request.URL.Scheme
-								locationURL.Host = proxyHost
-								resp.Header.Set("Location", locationURL.String())
-							}
-						}
-					}
-				}
-				return nil
-			},
-			ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
-				log.Printf("Proxy error: %v", err)
-				rw.WriteHeader(http.StatusBadGateway)
-			},
+		// Use the configured transport to proxy the request
+		if p.transport != nil {
+			p.transport.ServeHTTP(w, r, tokenInfo)
+		} else {
+			handlerutils.JSON(w, http.StatusInternalServerError, map[string]string{
+				"error":             "server_error",
+				"error_description": "Transport not configured for proxy mode",
+			})
 		}
-
-		// Serve the proxied request
-		proxy.ServeHTTP(w, r)
 	}
 }
 
@@ -611,4 +593,19 @@ func ParseAllowedEmails(envAllowedEmails string) []string {
 		}
 	}
 	return allowedEmails
+}
+
+// parseEnvJSON parses a JSON object of environment variables and returns a map.
+// Returns nil if the JSON is empty or invalid.
+func parseEnvJSON(envJSON string) map[string]string {
+	if envJSON == "" {
+		return nil
+	}
+
+	var envMap map[string]string
+	if err := json.Unmarshal([]byte(envJSON), &envMap); err != nil {
+		log.Printf("Warning: failed to parse MCP_SERVER_ENV JSON: %v", err)
+		return nil
+	}
+	return envMap
 }

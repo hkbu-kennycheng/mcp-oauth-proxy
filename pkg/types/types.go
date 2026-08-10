@@ -22,6 +22,9 @@ type Config struct {
 	TrustedAudiences     []string
 	EncryptionKey        string
 	MCPServerURL         string
+	MCPServerCommand     string // Command to execute MCP server as stdio subprocess
+	MCPServerEnv         string // JSON object of environment variables for the MCP server subprocess
+	MCPServerCwd         string // Working directory for MCP server subprocess
 	Mode                 string
 	RoutePrefix          string
 	CookieNamePrefix     string

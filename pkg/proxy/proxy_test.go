@@ -93,7 +93,7 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		}
 		_, err := NewOAuthProxy(config)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid MCP server URL")
+		assert.Contains(t, err.Error(), "either mcp-server-url or mcp-server-command is required")
 	})
 
 	t.Run("ForwardAuthModeDoesNotRequireMCPServerURL", func(t *testing.T) {
@@ -426,7 +426,7 @@ func TestModeSpecificValidation(t *testing.T) {
 			mode:          ModeProxy,
 			mcpServerURL:  "",
 			expectError:   true,
-			errorContains: "invalid MCP server URL",
+			errorContains: "either mcp-server-url or mcp-server-command is required",
 		},
 		{
 			name:          "ProxyModeInvalidScheme",
