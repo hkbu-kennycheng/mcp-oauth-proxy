@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/tokens"
 )
@@ -89,7 +90,10 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 	// Check if this is an initialize request and inject user context
 	if isInitializeRequest(body) {
 		body = injectUserContext(body, tokenInfo)
+		log.Printf("Injected user context into initialize request")
 	}
+
+	log.Printf("Sending %d bytes to MCP server", len(body))
 
 	// Send the message to the MCP server
 	response, err := t.sendMessage(ctx, session, body)
@@ -98,6 +102,8 @@ func (t *StdioTransport) ServeHTTP(w http.ResponseWriter, r *http.Request, token
 		http.Error(w, fmt.Sprintf("MCP server error: %v", err), http.StatusBadGateway)
 		return
 	}
+
+	log.Printf("Received %d bytes from MCP server", len(response))
 
 	// Set content type and write response
 	w.Header().Set("Content-Type", "application/json")
@@ -171,11 +177,26 @@ func (t *StdioTransport) spawnProcess(ctx context.Context) (*StdioSession, error
 	// Start a goroutine to wait for process exit
 	go func() {
 		<-sessionCtx.Done()
-		// Ensure process is killed if context is cancelled
-		if session.cmd.Process != nil {
-			session.cmd.Process.Kill()
+		// Close stdin to signal the process to exit naturally
+		if session.stdin != nil {
+			session.stdin.Close()
 		}
-		session.cmd.Wait()
+		// Wait briefly for the process to exit on its own
+		done := make(chan struct{})
+		go func() {
+			session.cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// Process exited naturally
+		case <-time.After(3 * time.Second):
+			// Force kill if it doesn't exit within 3 seconds
+			if session.cmd.Process != nil {
+				session.cmd.Process.Kill()
+			}
+			session.cmd.Wait()
+		}
 	}()
 
 	return session, nil
@@ -186,39 +207,59 @@ func (t *StdioTransport) sendMessage(ctx context.Context, session *StdioSession,
 	// Write the message to stdin followed by newline
 	session.writeMu.Lock()
 	_, err := session.stdin.Write(append(message, '\n'))
-	session.writeMu.Unlock()
 	if err != nil {
+		session.writeMu.Unlock()
 		return nil, fmt.Errorf("failed to write to MCP server: %w", err)
 	}
 
-	// Set up a reader for stdout with timeout
+	// Flush the stdin pipe to ensure the message is sent immediately
+	if flusher, ok := session.stdin.(interface{ Flush() error }); ok {
+		flushErr := flusher.Flush()
+		if flushErr != nil {
+			session.writeMu.Unlock()
+			return nil, fmt.Errorf("failed to flush MCP server input: %w", flushErr)
+		}
+	}
+	session.writeMu.Unlock()
+
+	// Set up a reader for stdout
 	reader := bufio.NewReader(session.stdout)
 
-	// Read response from stdout
+	// Read response from stdout - wait for a single line (JSON message)
 	session.readMu.Lock()
 	defer session.readMu.Unlock()
 
 	// Read one line (one JSON message)
 	response, err := reader.ReadBytes('\n')
 	if err != nil {
+		if err.Error() == "EOF" {
+			return nil, fmt.Errorf("MCP server closed connection unexpectedly")
+		}
 		return nil, fmt.Errorf("failed to read from MCP server: %w", err)
 	}
 
-	// Trim the trailing newline
-	response = bytes.TrimRight(response, "\n")
+	// Trim the trailing newline/carriage return
+	response = bytes.TrimRight(response, "\n\r")
+
+	if len(response) == 0 {
+		return nil, fmt.Errorf("empty response from MCP server")
+	}
+
+	// Validate that response looks like JSON
+	if len(response) > 0 && response[0] != '{' && response[0] != '[' {
+		return nil, fmt.Errorf("MCP server response is not valid JSON: %s", string(response))
+	}
 
 	return response, nil
 }
 
-// Terminate kills the subprocess and closes pipes
+// Terminate closes the stdin pipe to signal end of input to the MCP server.
+// The subprocess will naturally exit after finishing its response.
 func (s *StdioSession) Terminate() {
-	s.cancel()
-	// Close pipes to ensure resources are cleaned up
+	// Close stdin to signal we're done sending input
+	// This allows the MCP server to see EOF and finish its response naturally
 	if s.stdin != nil {
 		s.stdin.Close()
-	}
-	if s.stdout != nil {
-		s.stdout.Close()
 	}
 }
 

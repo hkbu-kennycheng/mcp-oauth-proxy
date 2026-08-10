@@ -53,7 +53,10 @@ func TestNewStdioTransport_WithEnv(t *testing.T) {
 
 	transport, err := NewStdioTransport("mock-server", env, "/tmp")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"API_KEY=key123", "DEBUG=true"}, transport.env)
+	// Order is not guaranteed due to Go map iteration, so check individual values
+	assert.Len(t, transport.env, 2)
+	assert.Contains(t, transport.env, "API_KEY=key123")
+	assert.Contains(t, transport.env, "DEBUG=true")
 	assert.Equal(t, "/tmp", transport.cwd)
 }
 
